@@ -93,9 +93,7 @@ pub enum Error {
 /// A [`Path`] maintains the following invariants:
 ///
 /// * Paths are delimited by `/`
-/// * Paths do not contain leading or trailing `/`
 /// * Paths do not contain relative path segments, i.e. `.` or `..`
-/// * Paths do not contain empty path segments
 /// * Paths do not contain any ASCII control characters
 ///
 /// There are no enforced restrictions on path length, however, it should be noted that most
@@ -123,7 +121,7 @@ pub enum Error {
 /// assert_eq!(Path::from("foo/bar").as_ref(), "foo/bar");
 /// assert_eq!(Path::from("foo//bar").as_ref(), "foo/bar");
 /// assert_eq!(Path::from("foo/../bar").as_ref(), "foo/%2E%2E/bar");
-/// assert_eq!(Path::from("/").as_ref(), "");
+/// assert_eq!(Path::from("/").as_ref(), "/");
 /// assert_eq!(Path::from_iter(["foo", "foo/bar"]).as_ref(), "foo/foo%2Fbar");
 /// ```
 ///
@@ -142,9 +140,10 @@ pub enum Error {
 ///
 /// ```
 /// # use object_store::path::Path;
-/// assert_eq!(Path::parse("/foo/foo%2Fbar").unwrap().as_ref(), "foo/foo%2Fbar");
+/// assert_eq!(Path::parse("/foo/foo%2Fbar").unwrap().as_ref(), "/foo/foo%2Fbar");
+/// assert_eq!(Path::parse("foo/bar/").unwrap().as_ref(), "foo/bar/");
+/// assert_eq!(Path::parse("foo//bar").unwrap().as_ref(), "foo//bar"); // Interior `//` is preserved
 /// Path::parse("..").unwrap_err(); // Relative path segments are disallowed
-/// Path::parse("/foo//").unwrap_err(); // Empty path segments are disallowed
 /// Path::parse("\x00").unwrap_err(); // ASCII control characters are disallowed
 /// ```
 ///
@@ -160,30 +159,26 @@ impl Path {
     /// Parse a string as a [`Path`], returning a [`Error`] if invalid,
     /// as defined on the docstring for [`Path`]
     ///
-    /// Note: this will strip any leading `/` or trailing `/`
+    /// Unlike [`Path::from`], this preserves any leading or trailing `/` in the
+    /// input.
     pub fn parse(path: impl AsRef<str>) -> Result<Self, Error> {
         let path = path.as_ref();
 
-        let stripped = path.strip_prefix(DELIMITER).unwrap_or(path);
-        if stripped.is_empty() {
+        if path.is_empty() {
             return Ok(Default::default());
         }
 
-        let stripped = stripped.strip_suffix(DELIMITER).unwrap_or(stripped);
-
-        for segment in stripped.split(DELIMITER) {
-            if segment.is_empty() {
-                return Err(Error::EmptySegment { path: path.into() });
+        for segment in path.split(DELIMITER) {
+            if !segment.is_empty() {
+                PathPart::parse(segment).map_err(|source| {
+                    let path = path.into();
+                    Error::BadSegment { source, path }
+                })?;
             }
-
-            PathPart::parse(segment).map_err(|source| {
-                let path = path.into();
-                Error::BadSegment { source, path }
-            })?;
         }
 
         Ok(Self {
-            raw: stripped.to_string(),
+            raw: path.to_string(),
         })
     }
 
@@ -225,14 +220,21 @@ impl Path {
         let url = absolute_path_to_url(path)?;
         let path = match base {
             Some(prefix) => {
-                url.path()
-                    .strip_prefix(prefix.path())
-                    .ok_or_else(|| Error::PrefixMismatch {
+                let stripped = url.path().strip_prefix(prefix.path()).ok_or_else(|| {
+                    Error::PrefixMismatch {
                         path: url.path().to_string(),
                         prefix: prefix.to_string(),
-                    })?
+                    }
+                })?;
+                // When the base URL has no trailing '/', strip_prefix leaves a
+                // leading '/' on the relative portion. Remove it.
+                stripped.strip_prefix(DELIMITER).unwrap_or(stripped)
             }
-            None => url.path(),
+            None => {
+                // Absolute filesystem paths always start with '/'; strip it so
+                // the resulting Path is relative to the filesystem root.
+                url.path().strip_prefix(DELIMITER).unwrap_or(url.path())
+            }
         };
 
         // Reverse any percent encoding performed by conversion to URL
@@ -257,8 +259,9 @@ impl Path {
 
     /// Returns the [`PathPart`] of this [`Path`]
     pub fn parts(&self) -> impl Iterator<Item = PathPart<'_>> {
-        self.raw
-            .split_terminator(DELIMITER)
+        // Strip a leading delimiter so that "/foo/bar" iterates as ["foo", "bar"].
+        let raw = self.raw.strip_prefix(DELIMITER).unwrap_or(&self.raw);
+        raw.split_terminator(DELIMITER)
             .map(|s| PathPart { raw: s.into() })
     }
 
@@ -287,8 +290,14 @@ impl Path {
     ///
     /// Returns `None` if the prefix does not match
     pub fn prefix_match(&self, prefix: &Self) -> Option<impl Iterator<Item = PathPart<'_>> + '_> {
-        let mut stripped = self.raw.strip_prefix(&prefix.raw)?;
-        if !stripped.is_empty() && !prefix.raw.is_empty() {
+        // Normalize by stripping a single leading '/' from both sides so that
+        // "/" (the root prefix) matches all paths regardless of whether they
+        // carry a leading slash themselves.
+        let self_raw = self.raw.strip_prefix(DELIMITER).unwrap_or(&self.raw);
+        let prefix_raw = prefix.raw.strip_prefix(DELIMITER).unwrap_or(&prefix.raw);
+
+        let mut stripped = self_raw.strip_prefix(prefix_raw)?;
+        if !stripped.is_empty() && !prefix_raw.is_empty() {
             stripped = stripped.strip_prefix(DELIMITER)?;
         }
         let iter = stripped
@@ -304,9 +313,19 @@ impl Path {
 
     /// Creates a new child of this [`Path`]
     pub fn child<'a>(&self, child: impl Into<PathPart<'a>>) -> Self {
-        let raw = match self.raw.is_empty() {
-            true => format!("{}", child.into().raw),
-            false => format!("{}{}{}", self.raw, DELIMITER, child.into().raw),
+        let child = child.into();
+        let raw = if self.raw.is_empty() {
+            child.raw.into_owned()
+        } else {
+            // Strip a trailing delimiter so that a path like "foo/bar/" produces
+            // "foo/bar/baz" rather than "foo/bar//baz".
+            let base = self.raw.strip_suffix('/').unwrap_or(&self.raw);
+            if base.is_empty() {
+                // self was just "/", treat it as root — same as empty path
+                child.raw.into_owned()
+            } else {
+                format!("{}{}{}", base, DELIMITER, child.raw)
+            }
         };
 
         Self { raw }
@@ -321,13 +340,39 @@ impl AsRef<str> for Path {
 
 impl From<&str> for Path {
     fn from(path: &str) -> Self {
-        Self::from_iter(path.split(DELIMITER))
+        if path.is_empty() {
+            return Self::default();
+        }
+        let has_leading = path.starts_with(DELIMITER);
+        let has_trailing = path.len() > 1 && path.ends_with(DELIMITER);
+
+        // Encode non-empty segments, collapsing any interior `//`
+        let middle = path
+            .split(DELIMITER)
+            .filter(|s| !s.is_empty())
+            .map(|s| PathPart::from(s).raw)
+            .join(DELIMITER);
+
+        let raw = if middle.is_empty() {
+            // Path was "/" (or only slashes); normalise to a single delimiter
+            DELIMITER.to_string()
+        } else if has_leading && has_trailing {
+            format!("{}{}{}", DELIMITER, middle, DELIMITER)
+        } else if has_leading {
+            format!("{}{}", DELIMITER, middle)
+        } else if has_trailing {
+            format!("{}{}", middle, DELIMITER)
+        } else {
+            middle
+        };
+
+        Self { raw }
     }
 }
 
 impl From<String> for Path {
     fn from(path: String) -> Self {
-        Self::from_iter(path.split(DELIMITER))
+        Self::from(path.as_str())
     }
 }
 
@@ -387,18 +432,21 @@ mod tests {
 
     #[test]
     fn test_parse() {
-        assert_eq!(Path::parse("/").unwrap().as_ref(), "");
+        // Empty string still maps to default
         assert_eq!(Path::parse("").unwrap().as_ref(), "");
 
-        let err = Path::parse("//").unwrap_err();
-        assert!(matches!(err, Error::EmptySegment { .. }));
-
-        assert_eq!(Path::parse("/foo/bar/").unwrap().as_ref(), "foo/bar");
-        assert_eq!(Path::parse("foo/bar/").unwrap().as_ref(), "foo/bar");
+        // Leading/trailing slashes are preserved
+        assert_eq!(Path::parse("/").unwrap().as_ref(), "/");
+        assert_eq!(Path::parse("/foo/bar/").unwrap().as_ref(), "/foo/bar/");
+        assert_eq!(Path::parse("/foo/bar").unwrap().as_ref(), "/foo/bar");
+        assert_eq!(Path::parse("foo/bar/").unwrap().as_ref(), "foo/bar/");
         assert_eq!(Path::parse("foo/bar").unwrap().as_ref(), "foo/bar");
 
-        let err = Path::parse("foo///bar").unwrap_err();
-        assert!(matches!(err, Error::EmptySegment { .. }));
+        // Interior empty segments (i.e. `//`) are now allowed
+        assert_eq!(Path::parse("//").unwrap().as_ref(), "//");
+        assert_eq!(Path::parse("foo///bar").unwrap().as_ref(), "foo///bar");
+        assert_eq!(Path::parse("/foo//").unwrap().as_ref(), "/foo//");
+        assert_eq!(Path::parse("foo//bar").unwrap().as_ref(), "foo//bar");
     }
 
     #[test]
@@ -416,7 +464,7 @@ mod tests {
         assert_eq!(built, cloud);
 
         // dir, no file
-        let cloud = Path::from("test_dir/");
+        let cloud = Path::from("test_dir");
         let built = Path::from_iter(["test_dir"]);
         assert_eq!(built, cloud);
 

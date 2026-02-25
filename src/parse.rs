@@ -103,16 +103,24 @@ impl ObjectStoreScheme {
     /// assert_eq!(path.as_ref(), "path/to/my/file");
     /// ```
     pub fn parse(url: &Url) -> Result<(Self, Path), Error> {
+        // For bucket-based schemes (`s3://bucket/key`, `gs://bucket/key`, …) the
+        // URL path is `/{key}`.  The leading `/` is structural (it separates the
+        // authority/bucket from the path) and must be stripped before the
+        // remaining string is treated as an object-store key.
+        //
+        // `strip_bucket` already removes the structural slash **and** the bucket
+        // name, so its result must NOT be stripped again.
+        let key_path = || url.path().strip_prefix('/').unwrap_or(url.path());
         let strip_bucket = || Some(url.path().strip_prefix('/')?.split_once('/')?.1);
 
         let (scheme, path) = match (url.scheme(), url.host_str()) {
-            ("file", None) => (Self::Local, url.path()),
-            ("memory", None) => (Self::Memory, url.path()),
-            ("s3" | "s3a", Some(_)) => (Self::AmazonS3, url.path()),
-            ("gs", Some(_)) => (Self::GoogleCloudStorage, url.path()),
+            ("file", None) => (Self::Local, key_path()),
+            ("memory", None) => (Self::Memory, key_path()),
+            ("s3" | "s3a", Some(_)) => (Self::AmazonS3, key_path()),
+            ("gs", Some(_)) => (Self::GoogleCloudStorage, key_path()),
             ("az", Some(_)) => (Self::MicrosoftAzure, strip_bucket().unwrap_or_default()),
-            ("adl" | "azure" | "abfs" | "abfss", Some(_)) => (Self::MicrosoftAzure, url.path()),
-            ("http", Some(_)) => (Self::Http, url.path()),
+            ("adl" | "azure" | "abfs" | "abfss", Some(_)) => (Self::MicrosoftAzure, key_path()),
+            ("http", Some(_)) => (Self::Http, key_path()),
             ("https", Some(host)) => {
                 if host.ends_with("dfs.core.windows.net")
                     || host.ends_with("blob.core.windows.net")
@@ -123,12 +131,12 @@ impl ObjectStoreScheme {
                 } else if host.ends_with("amazonaws.com") {
                     match host.starts_with("s3") {
                         true => (Self::AmazonS3, strip_bucket().unwrap_or_default()),
-                        false => (Self::AmazonS3, url.path()),
+                        false => (Self::AmazonS3, key_path()),
                     }
                 } else if host.ends_with("r2.cloudflarestorage.com") {
                     (Self::AmazonS3, strip_bucket().unwrap_or_default())
                 } else {
-                    (Self::Http, url.path())
+                    (Self::Http, key_path())
                 }
             }
             _ => return Err(Error::Unrecognised { url: url.clone() }),

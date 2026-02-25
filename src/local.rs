@@ -304,6 +304,14 @@ impl Config {
 }
 
 fn is_valid_file_path(path: &Path) -> bool {
+    let raw = path.as_ref();
+    // The local filesystem cannot correctly round-trip object keys that contain
+    // leading or trailing slashes: a key "/foo/bar" would be stored at
+    // `<root>/foo/bar` and listed back as "foo/bar", losing the leading slash.
+    // Similarly, `//` in the middle collapses at the OS level.
+    if raw.starts_with('/') || raw.ends_with('/') || raw.contains("//") {
+        return false;
+    }
     match path.filename() {
         Some(p) => match p.split_once('#') {
             Some((_, suffix)) if !suffix.is_empty() => {
@@ -1279,8 +1287,7 @@ mod tests {
         let integration = LocalFileSystem::new();
 
         let canonical = std::path::Path::new("Cargo.toml").canonicalize().unwrap();
-        let url = Url::from_directory_path(&canonical).unwrap();
-        let path = Path::parse(url.path()).unwrap();
+        let path = Path::from_absolute_path(&canonical).unwrap();
 
         let roundtrip = integration.path_to_filesystem(&path).unwrap();
 

@@ -314,12 +314,17 @@ impl ObjectStore for InMemory {
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
         let root = Path::default();
         let prefix = prefix.unwrap_or(&root);
+        // Normalize by stripping a leading '/' so "/" acts as root prefix.
+        let prefix_str = prefix.as_ref().strip_prefix('/').unwrap_or(prefix.as_ref());
 
         let storage = self.storage.read();
         let values: Vec<_> = storage
             .map
             .range((prefix)..)
-            .take_while(|(key, _)| key.as_ref().starts_with(prefix.as_ref()))
+            .take_while(|(key, _)| {
+                let key_str = key.as_ref().strip_prefix('/').unwrap_or(key.as_ref());
+                key_str.starts_with(prefix_str)
+            })
             .filter(|(key, _)| {
                 // Don't return for exact prefix match
                 key.prefix_match(prefix)
@@ -347,13 +352,17 @@ impl ObjectStore for InMemory {
         let root = Path::default();
         let prefix = prefix.unwrap_or(&root);
 
+        // Normalize by stripping a leading '/' so "/" acts as root prefix.
+        let prefix_str = prefix.as_ref().strip_prefix('/').unwrap_or(prefix.as_ref());
+
         let mut common_prefixes = BTreeSet::new();
 
         // Only objects in this base level should be returned in the
         // response. Otherwise, we just collect the common prefixes.
         let mut objects = vec![];
         for (k, v) in self.storage.read().map.range((prefix)..) {
-            if !k.as_ref().starts_with(prefix.as_ref()) {
+            let key_str = k.as_ref().strip_prefix('/').unwrap_or(k.as_ref());
+            if !key_str.starts_with(prefix_str) {
                 break;
             }
 
