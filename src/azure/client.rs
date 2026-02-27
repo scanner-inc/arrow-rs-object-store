@@ -183,7 +183,13 @@ impl AzureConfig {
             if self.is_emulator {
                 path_mut.push(&self.account);
             }
-            path_mut.push(&self.container).extend(path.parts());
+            path_mut.push(&self.container);
+            // Use split('/') rather than parts() to correctly preserve leading/trailing
+            // slashes and empty segments (consecutive slashes) in the blob name.
+            let raw = path.as_ref();
+            if !raw.is_empty() {
+                path_mut.extend(raw.split('/'));
+            }
         }
         url
     }
@@ -711,7 +717,7 @@ impl AzureClient {
         let body_bytes = self.build_bulk_delete_body(&boundary, &paths, &credential);
 
         // Send multipart request
-        let url = self.config.path_url(&Path::from("/"));
+        let url = self.config.path_url(&Path::default());
         let batch_response = self
             .client
             .post(url.as_str())

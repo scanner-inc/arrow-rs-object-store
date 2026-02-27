@@ -39,7 +39,10 @@ pub struct InvalidPart {
 /// A [`PathPart`] is guaranteed to:
 ///
 /// * Contain no ASCII control characters or `/`
-/// * Not be a relative path segment, i.e. `.` or `..`
+///
+/// A [`PathPart`] may be empty, representing an empty path segment (which produces
+/// leading/trailing slashes or consecutive slashes when a [`Path`] is constructed
+/// from an iterator of parts).
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Default, Hash)]
 pub struct PathPart<'a> {
     pub(super) raw: Cow<'a, str>,
@@ -48,13 +51,6 @@ pub struct PathPart<'a> {
 impl<'a> PathPart<'a> {
     /// Parse the provided path segment as a [`PathPart`] returning an error if invalid
     pub fn parse(segment: &'a str) -> Result<Self, InvalidPart> {
-        if segment == "." || segment == ".." {
-            return Err(InvalidPart {
-                segment: segment.to_string(),
-                illegal: segment.to_string(),
-            });
-        }
-
         for c in segment.chars() {
             if c.is_ascii_control() || c == '/' {
                 return Err(InvalidPart {
@@ -100,14 +96,9 @@ const INVALID: &AsciiSet = &CONTROLS
 
 impl<'a> From<&'a [u8]> for PathPart<'a> {
     fn from(v: &'a [u8]) -> Self {
-        let inner = match v {
-            // We don't want to encode `.` generally, but we do want to disallow parts of paths
-            // to be equal to `.` or `..` to prevent file system traversal shenanigans.
-            b"." => "%2E".into(),
-            b".." => "%2E%2E".into(),
-            other => percent_encode(other, INVALID).into(),
-        };
-        Self { raw: inner }
+        Self {
+            raw: percent_encode(v, INVALID).into(),
+        }
     }
 }
 
@@ -148,21 +139,25 @@ mod tests {
     }
 
     #[test]
-    fn path_part_cant_be_one_dot() {
+    fn path_part_one_dot() {
         let part: PathPart<'_> = ".".into();
-        assert_eq!(part.raw, "%2E");
+        assert_eq!(part.raw, ".");
     }
 
     #[test]
-    fn path_part_cant_be_two_dots() {
+    fn path_part_two_dots() {
         let part: PathPart<'_> = "..".into();
-        assert_eq!(part.raw, "%2E%2E");
+        assert_eq!(part.raw, "..");
     }
 
     #[test]
     fn path_part_parse() {
         PathPart::parse("foo").unwrap();
         PathPart::parse("foo/bar").unwrap_err();
+
+        // Relative path segments are now allowed
+        PathPart::parse(".").unwrap();
+        PathPart::parse("..").unwrap();
 
         // Test percent-encoded path
         PathPart::parse("foo%2Fbar").unwrap();

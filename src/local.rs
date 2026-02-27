@@ -285,8 +285,8 @@ impl Config {
         let mut url = self.root.clone();
         url.path_segments_mut()
             .expect("url path")
-            // technically not necessary as Path ignores empty segments
-            // but avoids creating paths with "//" which look odd in error messages.
+            // Paths with empty segments are rejected by is_valid_file_path before reaching here.
+            // pop_if_empty avoids a double-slash when the root URL has a trailing slash.
             .pop_if_empty()
             .extend(location.parts());
 
@@ -304,6 +304,18 @@ impl Config {
 }
 
 fn is_valid_file_path(path: &Path) -> bool {
+    let raw = path.as_ref();
+
+    // Paths with leading/trailing slashes, consecutive slashes (empty segments),
+    // or relative path segments cannot be represented as local filesystem paths
+    // and would produce incorrect or unsafe results.
+    if raw.starts_with('/') || raw.ends_with('/') || raw.contains("//") {
+        return false;
+    }
+    if raw.split('/').any(|s| s == "." || s == "..") {
+        return false;
+    }
+
     match path.filename() {
         Some(p) => match p.split_once('#') {
             Some((_, suffix)) if !suffix.is_empty() => {
@@ -1279,8 +1291,8 @@ mod tests {
         let integration = LocalFileSystem::new();
 
         let canonical = std::path::Path::new("Cargo.toml").canonicalize().unwrap();
-        let url = Url::from_directory_path(&canonical).unwrap();
-        let path = Path::parse(url.path()).unwrap();
+        let url = Url::from_file_path(&canonical).unwrap();
+        let path = Path::from_url_path(url.path()).unwrap();
 
         let roundtrip = integration.path_to_filesystem(&path).unwrap();
 
@@ -1586,6 +1598,10 @@ mod tests {
             ("foo#123/test#34", false),
             ("foo😁/test#34", false),
             ("foo/test#😁34", true),
+            ("foo/../bar", false),
+            ("foo/./bar", false),
+            (".hidden/file", true),
+            ("../escape", false),
         ];
 
         for (case, expected) in cases {

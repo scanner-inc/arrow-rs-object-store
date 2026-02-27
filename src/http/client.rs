@@ -119,7 +119,12 @@ impl Client {
 
     fn path_url(&self, location: &Path) -> String {
         let mut url = self.url.clone();
-        url.path_segments_mut().unwrap().extend(location.parts());
+        // Use split('/') rather than parts() to correctly preserve leading/trailing
+        // slashes and empty segments (consecutive slashes) in the path.
+        let raw = location.as_ref();
+        if !raw.is_empty() {
+            url.path_segments_mut().unwrap().extend(raw.split('/'));
+        }
         url.to_string()
     }
 

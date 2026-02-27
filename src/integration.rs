@@ -65,7 +65,7 @@ pub async fn put_get_delete_list(storage: &DynObjectStore) {
     let data = Bytes::from("arbitrary data");
     storage.put(&location, data.clone().into()).await.unwrap();
 
-    let root = Path::from("/");
+    let root = Path::default();
 
     // List everything
     let content_list = flatten_list_stream(storage, None).await.unwrap();

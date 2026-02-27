@@ -38,6 +38,9 @@ pub use parts::{InvalidPart, PathPart};
 #[non_exhaustive]
 pub enum Error {
     /// Error when there's an empty segment between two slashes `/` in the path
+    ///
+    /// Deprecated: [`Path::parse`] no longer rejects empty path segments.
+    /// This variant is retained for backwards compatibility but is never produced.
     #[error("Path \"{}\" contained empty path segment", path)]
     EmptySegment {
         /// The source path
@@ -93,10 +96,16 @@ pub enum Error {
 /// A [`Path`] maintains the following invariants:
 ///
 /// * Paths are delimited by `/`
-/// * Paths do not contain leading or trailing `/`
-/// * Paths do not contain relative path segments, i.e. `.` or `..`
-/// * Paths do not contain empty path segments
 /// * Paths do not contain any ASCII control characters
+///
+/// Unlike some other implementations, [`Path`] intentionally allows:
+/// * Leading or trailing `/` (e.g. `/foo/bar`, `foo/bar/`)
+/// * Empty path segments from consecutive slashes (e.g. `foo//bar`)
+/// * Relative path segments (`.` or `..`, e.g. `foo/../bar`)
+///
+/// These are all valid object keys on AWS S3, Google Cloud Storage, and Azure Blob Storage.
+/// Code that works with [`LocalFileSystem`] should be aware that such paths will be
+/// rejected with an error by the local filesystem backend.
 ///
 /// There are no enforced restrictions on path length, however, it should be noted that most
 /// object stores do not permit paths longer than 1024 bytes, and many filesystems do not
@@ -116,14 +125,15 @@ pub enum Error {
 ///
 /// A string containing potentially problematic path segments can therefore be encoded to a [`Path`]
 /// using [`Path::from`] or [`Path::from_iter`]. This will percent encode any problematic
-/// segments according to [RFC 1738].
+/// characters in each segment according to [RFC 1738], while preserving the path structure
+/// (including leading/trailing slashes and empty segments from consecutive slashes).
 ///
 /// ```
 /// # use object_store::path::Path;
 /// assert_eq!(Path::from("foo/bar").as_ref(), "foo/bar");
-/// assert_eq!(Path::from("foo//bar").as_ref(), "foo/bar");
-/// assert_eq!(Path::from("foo/../bar").as_ref(), "foo/%2E%2E/bar");
-/// assert_eq!(Path::from("/").as_ref(), "");
+/// assert_eq!(Path::from("foo//bar").as_ref(), "foo//bar");
+/// assert_eq!(Path::from("foo/../bar").as_ref(), "foo/../bar");
+/// assert_eq!(Path::from("/").as_ref(), "/");
 /// assert_eq!(Path::from_iter(["foo", "foo/bar"]).as_ref(), "foo/foo%2Fbar");
 /// ```
 ///
@@ -138,13 +148,14 @@ pub enum Error {
 ///
 /// Alternatively a [`Path`] can be parsed from an existing string, returning an
 /// error if it is invalid. Unlike the encoding methods above, this will permit
-/// arbitrary unicode, including percent encoded sequences.
+/// arbitrary unicode, including percent encoded sequences, as well as leading/trailing
+/// slashes and empty segments.
 ///
 /// ```
 /// # use object_store::path::Path;
-/// assert_eq!(Path::parse("/foo/foo%2Fbar").unwrap().as_ref(), "foo/foo%2Fbar");
-/// Path::parse("..").unwrap_err(); // Relative path segments are disallowed
-/// Path::parse("/foo//").unwrap_err(); // Empty path segments are disallowed
+/// assert_eq!(Path::parse("/foo/foo%2Fbar").unwrap().as_ref(), "/foo/foo%2Fbar");
+/// assert_eq!(Path::parse("foo/../bar").unwrap().as_ref(), "foo/../bar"); // Relative segments are allowed
+/// Path::parse("/foo//").unwrap(); // Leading/trailing slashes and empty segments are allowed
 /// Path::parse("\x00").unwrap_err(); // ASCII control characters are disallowed
 /// ```
 ///
@@ -152,30 +163,24 @@ pub enum Error {
 /// [`LocalFileSystem`]: crate::local::LocalFileSystem
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Ord, PartialOrd)]
 pub struct Path {
-    /// The raw path with no leading or trailing delimiters
+    /// The raw path, stored exactly as provided to [`Path::parse`].
+    /// May contain leading/trailing slashes and consecutive slashes (empty segments).
     raw: String,
 }
 
 impl Path {
-    /// Parse a string as a [`Path`], returning a [`Error`] if invalid,
-    /// as defined on the docstring for [`Path`]
+    /// Parse a string as a [`Path`], returning a [`Error`] if invalid.
     ///
-    /// Note: this will strip any leading `/` or trailing `/`
+    /// The path is stored as-is, preserving any leading or trailing `/`,
+    /// consecutive `/` characters (empty segments), and relative path segments
+    /// (`.` or `..`). Only ASCII control characters are rejected.
     pub fn parse(path: impl AsRef<str>) -> Result<Self, Error> {
         let path = path.as_ref();
 
-        let stripped = path.strip_prefix(DELIMITER).unwrap_or(path);
-        if stripped.is_empty() {
-            return Ok(Default::default());
-        }
-
-        let stripped = stripped.strip_suffix(DELIMITER).unwrap_or(stripped);
-
-        for segment in stripped.split(DELIMITER) {
+        for segment in path.split(DELIMITER) {
             if segment.is_empty() {
-                return Err(Error::EmptySegment { path: path.into() });
+                continue; // Leading/trailing slashes and consecutive slashes are allowed
             }
-
             PathPart::parse(segment).map_err(|source| {
                 let path = path.into();
                 Error::BadSegment { source, path }
@@ -183,7 +188,7 @@ impl Path {
         }
 
         Ok(Self {
-            raw: stripped.to_string(),
+            raw: path.to_string(),
         })
     }
 
@@ -242,7 +247,10 @@ impl Path {
     /// Parse a url encoded string as a [`Path`], returning a [`Error`] if invalid
     ///
     /// This will return an error if the path contains illegal character sequences
-    /// as defined on the docstring for [`Path`]
+    /// as defined on the docstring for [`Path`].
+    ///
+    /// Note: this strips a single structural leading `/` that is part of the URL
+    /// representation but not the object key itself (e.g. the `/` in `s3://bucket/key`).
     pub fn from_url_path(path: impl AsRef<str>) -> Result<Self, Error> {
         let path = path.as_ref();
         let decoded = percent_decode(path.as_bytes())
@@ -252,7 +260,11 @@ impl Path {
                 Error::NonUnicode { source, path }
             })?;
 
-        Self::parse(decoded)
+        // Strip the single leading slash that is structural to URLs (not part of the object key).
+        // E.g. for URL `s3://bucket/foo/bar`, `url.path()` returns `/foo/bar`; the leading `/`
+        // is a URL artifact, not part of the object key `foo/bar`.
+        let path = decoded.strip_prefix(DELIMITER).unwrap_or(&decoded);
+        Self::parse(path)
     }
 
     /// Returns the [`PathPart`] of this [`Path`]
@@ -350,7 +362,6 @@ where
     fn from_iter<T: IntoIterator<Item = I>>(iter: T) -> Self {
         let raw = T::into_iter(iter)
             .map(|s| s.into())
-            .filter(|s| !s.raw.is_empty())
             .map(|s| s.raw)
             .join(DELIMITER);
 
@@ -387,49 +398,47 @@ mod tests {
 
     #[test]
     fn test_parse() {
-        assert_eq!(Path::parse("/").unwrap().as_ref(), "");
+        // Empty path
         assert_eq!(Path::parse("").unwrap().as_ref(), "");
 
-        let err = Path::parse("//").unwrap_err();
-        assert!(matches!(err, Error::EmptySegment { .. }));
-
-        assert_eq!(Path::parse("/foo/bar/").unwrap().as_ref(), "foo/bar");
-        assert_eq!(Path::parse("foo/bar/").unwrap().as_ref(), "foo/bar");
+        // Leading/trailing slashes and empty segments are now preserved
+        assert_eq!(Path::parse("/").unwrap().as_ref(), "/");
+        assert_eq!(Path::parse("//").unwrap().as_ref(), "//");
+        assert_eq!(Path::parse("/foo/bar/").unwrap().as_ref(), "/foo/bar/");
+        assert_eq!(Path::parse("foo/bar/").unwrap().as_ref(), "foo/bar/");
         assert_eq!(Path::parse("foo/bar").unwrap().as_ref(), "foo/bar");
+        assert_eq!(Path::parse("foo///bar").unwrap().as_ref(), "foo///bar");
 
-        let err = Path::parse("foo///bar").unwrap_err();
-        assert!(matches!(err, Error::EmptySegment { .. }));
+        // Relative path segments are now allowed
+        assert_eq!(Path::parse("..").unwrap().as_ref(), "..");
+        assert_eq!(Path::parse("foo/../bar").unwrap().as_ref(), "foo/../bar");
     }
 
     #[test]
     fn convert_raw_before_partial_eq() {
-        // dir and file_name
+        // dir and file_name: both constructors produce the same result
         let cloud = Path::from("test_dir/test_file.json");
         let built = Path::from_iter(["test_dir", "test_file.json"]);
-
         assert_eq!(built, cloud);
 
         // dir and file_name w/o dot
         let cloud = Path::from("test_dir/test_file");
         let built = Path::from_iter(["test_dir", "test_file"]);
-
         assert_eq!(built, cloud);
 
-        // dir, no file
-        let cloud = Path::from("test_dir/");
-        let built = Path::from_iter(["test_dir"]);
-        assert_eq!(built, cloud);
+        // Trailing slash is preserved by Path::from but not produced by from_iter
+        assert_eq!(Path::from("test_dir/").as_ref(), "test_dir/");
+        assert_eq!(Path::from_iter(["test_dir"]).as_ref(), "test_dir");
 
         // file_name, no dir
         let cloud = Path::from("test_file.json");
         let built = Path::from_iter(["test_file.json"]);
         assert_eq!(built, cloud);
 
-        // empty
-        let cloud = Path::from("");
-        let built = Path::from_iter(["", ""]);
-
-        assert_eq!(built, cloud);
+        // empty string: single empty segment, no delimiter
+        assert_eq!(Path::from("").as_ref(), "");
+        // two empty parts joined with "/" gives "/"
+        assert_eq!(Path::from_iter(["", ""]).as_ref(), "/");
     }
 
     #[test]
@@ -574,14 +583,14 @@ mod tests {
     #[test]
     fn from_url_path() {
         let a = Path::from_url_path("foo%20bar").unwrap();
-        let b = Path::from_url_path("foo/%2E%2E/bar").unwrap_err();
+        let b = Path::from_url_path("foo/%2E%2E/bar").unwrap();
         let c = Path::from_url_path("foo%2F%252E%252E%2Fbar").unwrap();
         let d = Path::from_url_path("foo/%252E%252E/bar").unwrap();
         let e = Path::from_url_path("%48%45%4C%4C%4F").unwrap();
         let f = Path::from_url_path("foo/%FF/as").unwrap_err();
 
         assert_eq!(a.raw, "foo bar");
-        assert!(matches!(b, Error::BadSegment { .. }));
+        assert_eq!(b.raw, "foo/../bar");
         assert_eq!(c.raw, "foo/%2E%2E/bar");
         assert_eq!(d.raw, "foo/%2E%2E/bar");
         assert_eq!(e.raw, "HELLO");

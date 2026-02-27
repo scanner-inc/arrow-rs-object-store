@@ -263,7 +263,7 @@ mod tests {
         let content_list = flatten_list_stream(&prefix, None).await.unwrap();
         assert_eq!(content_list, slice::from_ref(&location_prefix));
 
-        let root = Path::from("/");
+        let root = Path::default();
         let content_list = flatten_list_stream(&prefix, Some(&root)).await.unwrap();
         assert_eq!(content_list, slice::from_ref(&location_prefix));
 
@@ -276,7 +276,7 @@ mod tests {
             .unwrap();
         assert_eq!(&*read_data, data);
 
-        let target_prefix = Path::from("/test_written.json");
+        let target_prefix = Path::from("test_written.json");
         prefix
             .put(&target_prefix, data.clone().into())
             .await
